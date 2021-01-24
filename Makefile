@@ -1,9 +1,9 @@
 HEADERS = src/sqlTable.h src/sql.h
 
 TABLE_OBJS=obj/flTable.o obj/sqlTable.o obj/sql.o obj/Fl_Browser_Input.o\
-		  ../sqlite3/sqlite3.o
+		  sqlite3/sqlite3.o
 
-INCLUDE = -I. -I../sqlite3
+INCLUDE = -I. -Isqlite3
 CFLAGS= -Os -std=c++11 ${shell fltk-config --cxxflags}
 LDFLAGS = ${shell fltk-config --ldstaticflags} -lstdc++ -ldl -lpthread
 
