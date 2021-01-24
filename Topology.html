@@ -1,0 +1,770 @@
+<!doctype html>
+<html>
+	<head>
+		<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+		<title>Topology</title>
+		<link rel='stylesheet' href='http://code.jquery.com/ui/1.12.1/themes/base/jquery-ui.css'>
+		<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/jquery-contextmenu/2.5.0/jquery.contextMenu.css'>
+		<style>
+			html, body { height: 100%; margin: 0; font-size: 14px; font-weight: bold; }
+			table, th, td { border-collapse: collapse; border: 1px solid black;
+							table-layout:fixed; white-space: pre; }
+			li {cursor: default; }
+			.canvas { border:1px solid #666666; min-height: 95%; z-index: -1; }
+			.link { cursor: default; position: absolute; z-index: 4; }
+			.node { cursor: pointer; position: absolute; z-index: 5; 
+					text-align: center; line-height: 80%; font-size: 12px; }
+			.alarm { cursor: pointer; position: absolute; z-index: 6; font-size: 12px; 
+					 text-align: right; width: 80px; line-height: 80%; }
+			.label { cursor: default; position: absolute; z-index: 6; 
+					 color: green; font-size: 10px; }
+			.ui-menu { position: absolute; width: 100px; height:0px; z-index: 10; }
+			.ui-selected { background-color: orange; }
+			.dialog { display: none; overflow: auto; }
+		</style>
+		<script src='https://code.jquery.com/jquery-3.2.1.min.js'></script>
+		<script src='https://code.jquery.com/ui/1.12.1/jquery-ui.min.js'></script>
+		<script src='https://jsplumbtoolkit.com/lib/jsplumb.min.js'></script>
+		<script src='https://cdnjs.cloudflare.com/ajax/libs/jquery-contextmenu/2.5.0/jquery.contextMenu.js'></script>
+<script type='text/javascript'>
+const URL = "/";
+const nodeSQL = "select nodename,address,protocol,type,status,top,left from Nodes";
+const alarmSQL= "select nodename,severity,count(alarm) from Alarms where cleared='' group by nodename, severity order by nodename, severity";
+const intf_SQL = "select nodename,interface,admin_status,oper_status,memo,pm_data from Interfaces where substr(memo,6,5)='peer:'";
+const port_SQL = "select nodename,equipment,admin_status,oper_status,memo,pm_data from Equipment where substr(memo,6,5)='peer:' order by circuit_id";
+const conn_SQL = "select nodename,source,pm_data,destination,memo from Connections order by memo DESC";
+
+const SELECTED=0, ADDRESS=1, PROTOCOL=2, TYPE=3, STATUS=4, LINKTABLE=5, XCONNTABLE=6;
+var nodeData = "";
+var nodeTable = new Object();	//id=nodeName, Array 0:selected 1:address 2:protocol, 
+								//			3:type 4:STATUS 5:linkTable 6:xconnTable
+var linkTable = new Object();	//id=rnode, Array 0:port 1:rport 2:pm_data 3:conn
+var xconnTable = new Object();	//id=ifName.ch, Array 0:primary 1:dport 2:pm_src 3:wavelength
+var linkLabel ="port name";
+
+const alarmColors = {
+	critical:'red',
+	major:'orange',
+	minor:'blue',
+	warning:'grey'
+}
+const linkPaintStyle = {
+	stroke : "yellow",
+	strokeWidth : 4,
+	outlineWidth : 1
+};
+const linkOperDownPaintStyle = {
+	stroke : "red",
+	strokeWidth : 6,
+	outlineWidth : 1
+};
+const linkAdminDownPaintStyle = {
+	stroke : "cyan",
+	strokeWidth : 6,
+	outlineWidth : 1
+};
+const hoverPaintStyle = {
+	stroke : "blue",
+	strokeWidth : 6
+};
+const connPaintStyle = {
+	stroke : "lightblue",
+	strokeWidth : 2,
+	outlineWidth : 1
+};
+
+jsPlumb.bind('ready', function() {
+	jsPlumb.Defaults.DragOptions = {
+		cursor : "pointer",
+		zIndex : 2000
+	};
+	jsPlumb.setContainer("topo");
+
+	$('#menu').menu({
+		select: function(event, ui) {
+			linkLabel = ui.item.text();
+			if ( linkLabel=='none' ) {
+				jsPlumb.select().removeAllOverlays();
+			}
+			else  {
+				for ( var nodeId in nodeTable ) {
+					var linkTable = nodeTable[nodeId][LINKTABLE];
+					for ( var rnode in linkTable ) {
+						var conn = linkTable[rnode][3];
+						var ifLabel = (linkLabel=='port name')?
+										linkTable[rnode][0] : linkTable[rnode][2];
+						conn.removeAllOverlays();		
+						conn.addOverlay([ "Label", { label:ifLabel, location:0.3, 
+													 cssClass:"label"} ]);
+					}
+				}
+				jsPlumb.select().showOverlays();
+			}
+		}
+	});
+	$.contextMenu({			//node context menu
+		selector: '.link',
+		callback: function(key, options){
+			var conn = options.$trigger[0]._jsPlumb;
+			var srcNode = conn.sourceId.split('_')[1];
+			var dstNode = conn.targetId.split('_')[1];
+			if ( key=='channels' ) 
+				if ( nodeTable[srcNode][TYPE]=="L-Series" ) 
+					showChannels(srcNode, dstNode);
+				else
+					showChannels(dstNode, srcNode);
+		}, 
+		items: {
+			'channels': {name: "Channels"}
+		}
+	});
+	$.contextMenu({			//node context menu
+		selector: '.node, .alarm',
+		callback: function(key, options){
+			var nodeId = options.$trigger[0].id.split('_')[1];
+			nodeTable[nodeId][SELECTED] = true;
+			$('#node_'+nodeId).css({"background-color": "cyan"});
+			if ( key=='login' ) connectNode(nodeId);
+			else if ( key=='logout' ) disconnNode(nodeId);
+			else if ( key=='resync' ) resyncNode(nodeId);
+			else if ( key=='logging' )loggingNode(nodeId);
+			else if ( key=='cli' )	  cliNode(nodeId);
+			else if ( key=='circts' ) showCircuits(nodeId);
+			else if ( key=='alarms' ) showAlarms(nodeId);
+			else if ( key=='PM' )	  showPM(nodeId);
+			else if ( key=='clone' )  cloneNode(nodeId);
+			else if ( key=='delete' ) deleteNode(nodeId);
+		}, 
+		items: {
+			"login"	: {name: "Login"},
+			"logout": {name: "Logout"},
+			"resync": {name: "Resync"},
+			"logging": {name: "Logging"},
+			"alarms": {name: "Alarms"},
+			'circts': {name: "Circuits"},
+			'PM'	: {name: 'PM Counters'},
+			"cli"	: {name: "CLI"},
+			"clone"	: {name: "Clone node"},
+			"delete": {name: "Delete node"}
+		}
+	});
+	// clear node selection on background click
+	$('#topo').on('click', function(event, ui) {
+			$('.node').css({"background-color": ""});
+			for ( nodeId in nodeTable )
+				nodeTable[nodeId][SELECTED] = false;
+	})
+	loadTopology();
+//	var interval = setInterval(loadTopology, 15000);
+});
+
+function loadTopology()
+{	 
+	for ( var nodeName in nodeTable ) {
+		var linkTable = nodeTable[nodeName][LINKTABLE];
+		for ( var rNode in linkTable ) 
+			linkTable[rNode][2]="";	//clear PM for update
+	}
+
+	$.ajaxSetup({async: false});
+	$.ajax({				//get nodes
+		url: URL,
+		async: false,
+		mothed: "POST",
+		data : { SQL: nodeSQL },
+		success: function(data, status) {
+			var nodes = data.split("\n");
+			for ( var i=1; i<nodes.length; i++) {
+				if ( nodeData.indexOf(nodes[i]) != -1 ) continue;
+				var node = nodes[i].split('\t');
+				var nodeName = node[0];
+				var nodeAddr = node[1];
+				var nodeProt = node[2]
+				var nodeType = node[3].replace(" ", "_");
+				var nodeStatus = node[4];
+				if ( nodeName in nodeTable ) {
+					nodeTable[nodeName][ADDRESS] = nodeAddr;
+					nodeTable[nodeName][PROTOCOL] = nodeProt;
+					nodeTable[nodeName][TYPE] = nodeType;
+					nodeTable[nodeName][STATUS] = nodeStatus;
+					$('#node_'+nodeName).html('<img src="img/'+nodeType+'.png"><br>'+nodeName);
+				}
+				else {	//draw node
+					var linkTable = new Object();
+					var xconnTable = new Object();
+					if ( node[3]=="L200" ) {
+						xconnTable["ots-1/0/0/E1"]=new Array(true,"ots-1/0/0/E2","","");
+						xconnTable["ots-1/0/0/E2"]=new Array(true,"ots-1/0/0/E1","","");
+					}
+					nodeTable[nodeName] = new Array(false,nodeAddr,nodeProt,nodeType,nodeStatus,linkTable,xconnTable);	
+					drawNode(nodeName, nodeType, node[6], node[5]);
+				}
+			}
+			nodeData = data;
+		}
+	});
+	$.post( URL, { SQL: alarmSQL }, drawAlarms );	//alarms
+	$.post( URL, { SQL: intf_SQL }, drawLinks );	//interface links
+	$.post( URL, { SQL: port_SQL }, drawLinks );	//equipment links
+	$.post( URL, { SQL: conn_SQL }, drawConns );	//connections
+	setTimeout(loadTopology, 10000);
+}
+function drawNode(nodeName, nodeType, x, y) 
+{
+	// append node div
+	$('#topo').append('<div class="node" id="node_' + nodeName + 
+			'"><img src="img/'+nodeType+'.png"><br>'+nodeName+'</div>');
+	$('#node_'+nodeName).css ({"top": y + "px", "left": x + "px"});	 
+	$('#node_'+nodeName).draggable({ drag: function(event, ui) {
+			var nodeName = event.target.id.split('_')[1];
+			var x = ui.position.left;
+			var y = ui.position.top;
+			$('#alarm_'+ nodeName).css({"top": parseInt(y)+8, "left": x});
+			jsPlumb.repaintEverything();
+		}	
+	});
+	// save node position when stop dragging
+	$('#node_'+nodeName).on('dragstop', function(event, ui) {
+		var x = parseInt(ui.position.left);
+		var y = parseInt(ui.position.top);
+		var nodeId = $(this).attr('id').split('_')[1];
+		$.post( URL,
+			{
+				SQL: "update nodes set left='"+x+"', top='"+y+"' where nodename='"+nodeId+"'"
+			}
+		);
+	});
+	// click to select node
+	$('#node_'+nodeName).on('click', function(event, ui) {
+		var nodeId = $(this).attr('id').split('_')[1];
+		nodeTable[nodeId][SELECTED] = !nodeTable[nodeId][SELECTED];
+		if ( nodeTable[nodeId][SELECTED])
+			$('#node_'+nodeId).css({"background-color": "cyan"}); 
+		else 
+			$('#node_'+nodeId).css({"background-color": ""});  
+		event.stopPropagation();
+	})
+	// dblclick to open webGUI
+	$('#node_'+nodeName).on('dblclick', function(event, ui) {
+		var nodeId = $(this).attr('id').split('_')[1];
+		var win = window.open('http://'+nodeTable[nodeId][ADDRESS], '_blank');
+		win.focus();
+	})
+
+	// append alarm count div
+	$('#topo').append('<div class="alarm" id="alarm_'+nodeName+'"></div>');
+	$('#alarm_'+nodeName).css ({"top": parseInt(y)+8+"px", "left": x+"px"});
+	// dblclick to show alarms
+	$('#alarm_'+nodeName).on('dblclick', function(event, ui) {
+		var nodeId = $(this).attr('id').split('_')[1];
+		showAlarms(nodeId);
+		event.stopPropagation();
+	})
+}
+function drawAlarms(data, status)
+{ //alarm counts
+	var lastNode = ""; 
+	var alarms = data.split("\n");
+	$('.alarm').empty();
+	for ( var i=1; i<alarms.length; i++) {
+		var alarm = alarms[i].split("\t");
+		var nodeName = alarm[0];
+		if ( nodeName in nodeTable )
+		if ( nodeName != lastNode ) {
+			var	nodeStatus = nodeTable[nodeName][STATUS];
+			if ( nodeStatus=='Connected' ) {
+				$('#alarm_'+nodeName).html(alarm[2]);
+				$('#alarm_'+nodeName).css({"color": alarmColors[alarm[1]]});
+			}
+			lastNode = nodeName;
+		}
+	}
+	for ( var nodeName in nodeTable ) {
+		var nodeStatus = nodeTable[nodeName][STATUS];
+		if ( nodeStatus!='Connected' ) {
+			$('#alarm_'+nodeName).html(nodeStatus);
+			$('#alarm_'+nodeName).css({"color": "grey"});
+		}
+	}
+}
+function drawLinks(data, status)
+{
+	jsPlumb.setSuspendDrawing(true);
+	var links = data.split("\n");
+	for ( var i=1; i<links.length; i++) {
+		var link = links[i].split("\t");
+		var nodeId1 = link[0];
+		var ifName1 = link[1].replace("port-","");
+		var paintStyle = linkPaintStyle;
+		if ( link[2]!="up" && link[2]!="inService" ) 
+			paintStyle = linkAdminDownPaintStyle;
+		if ( link[3]!="up" && link[2]!="inService" ) 
+			paintStyle = linkOperDownPaintStyle;
+
+		var node2 = link[4].split(" ");
+		var nodeId2 = node2[2];
+		var ifName2 = node2[3].replace("port-","");
+
+		if ( !(nodeId1 in nodeTable) || !(nodeId2 in nodeTable) ) continue;
+		var linkTable = nodeTable[nodeId1][LINKTABLE];
+
+		if ( nodeId2 in linkTable ) {
+			if ( linkTable[nodeId2][0].indexOf(ifName1)==-1 ) {
+				linkTable[nodeId2][0] += "<br/>"+ifName1;
+				linkTable[nodeId2][1] += "<br/>"+ifName2;
+			}
+			linkTable[nodeId2][2] += link[5]+"<br/>"; //update PM
+			var conn = linkTable[nodeId2][3];
+			conn.setPaintStyle(paintStyle);		//update paint style
+			var ifLabel = (linkLabel=='port name')?
+							linkTable[nodeId2][0] : linkTable[nodeId2][2];
+			conn.removeAllOverlays();		
+			conn.addOverlay([ "Label", { label:ifLabel, location:0.3, 
+													 cssClass:"label"} ]);
+		}
+		else {
+			var conn = jsPlumb.connect({
+				source: 'node_'+nodeId1,
+				target: 'node_'+nodeId2,
+				connector: ["Straight"],
+				overlays:[[ "Label", { label:ifName1, location:0.3, cssClass:"label"} ]],
+				endpoint: "Blank",
+				anchor:[ "Center" ],
+				paintStyle: paintStyle,
+				hoverPaintStyle: hoverPaintStyle,
+				cssClass: "link"
+			});
+			linkTable[nodeId2] = new Array(ifName1,ifName2,link[5]+"<br/>",conn);
+		}
+	}
+	jsPlumb.setSuspendDrawing(false, true);
+}
+function drawConns(data, status)
+{
+	var conns = data.split("\n");
+	for ( var i=1; i<conns.length; i++) {
+		var conn = conns[i].split("\t");
+		if ( conn[0] in nodeTable ) {
+			var xconnTable = nodeTable[conn[0]][XCONNTABLE];
+			var sport = conn[1];
+			if ( sport.indexOf("och-")==0 ) 
+				sport = sport.replace("/0/0/E1.", "/0/E1."); 
+			var dport = conn[3];
+			if ( dport.indexOf("och-")==0 ) 
+				dport = dport.replace("/0/0/E1.", "/0/E1.");
+			var ch = conn[4].split('  ')[0];
+			xconnTable[sport] = new Array(true,dport,conn[2],ch);	
+		}
+	}
+}
+function highlightLink(sNode, src)
+{	//src,dst are the soruce and destination of an cross connect
+	var linkTable = nodeTable[sNode][LINKTABLE];
+	var port = src.split(/[-.]/)[1];
+	var ch = src.split(".")[1];
+	
+	for ( dNode in linkTable ) if ( linkTable[dNode][0].indexOf(port)!=-1 ) {
+		var conn = linkTable[dNode][3];
+		conn.setPaintStyle(connPaintStyle);
+		var xconnTable = nodeTable[sNode][XCONNTABLE];
+
+		var dst = "";
+		if ( src in xconnTable ) {
+			dst = xconnTable[src][1];
+			var srcPM = xconnTable[src][2];
+			var srcLabel = (linkLabel=="port name")?src:srcPM;	
+			conn.removeAllOverlays();
+			conn.addOverlay([ "Label", { label:srcLabel, location:0.3, 
+													cssClass:"label"} ]);
+		}
+		else {
+			src = src.split(".")[0];
+			if ( src in xconnTable ) {
+				dst = xconnTable[src][1]+"."+ch;
+			}
+		}
+		if ( dst!="" ) {
+			port = dst.split(/[-.]/)[1];
+			for ( dNode in linkTable ) if ( linkTable[dNode][0].indexOf(port)!=-1 ) {
+				var conn = linkTable[dNode][3];
+				conn.setPaintStyle(connPaintStyle);
+				if ( dst in xconnTable ) {
+					var dstPM = xconnTable[dst][2];
+					var dstLabel = (linkLabel=="port name")?dst:dstPM;	
+					conn.removeAllOverlays();		
+					conn.addOverlay([ "Label", { label:dstLabel, location:0.3, 
+														cssClass:"label"} ]);
+				}	
+				var sIfNames = linkTable[dNode][0].split("<br/>");
+				var dIfNames = linkTable[dNode][1].split("<br/>");
+				var i=0;
+				while ( sIfNames[i]!=port ) i++;
+				var rSrc = dst.replace(port, dIfNames[i]);
+				highlightLink(dNode, rSrc);
+			}
+		}
+	}
+}
+function showCircuits(nodeId)
+{
+	var xconnTable = nodeTable[nodeId][XCONNTABLE];
+	$('#sel_list').empty();
+	for ( var sport in xconnTable ) {
+		if ( sport < xconnTable[sport][1] )
+			$('#sel_list').append( '<li><pre>'+sport+"\t"+xconnTable[sport][1]
+								  +"\t"+xconnTable[sport][3]+"</pre></li>");
+	}
+	$('#sel_list').selectable({
+		selected: function(event, ui) {
+			jsPlumb.setSuspendDrawing(true);
+			var conn = $(ui.selected).text().split("\t");
+			highlightLink(nodeId, conn[0]);
+			highlightLink(nodeId, conn[1]);
+			jsPlumb.setSuspendDrawing(false, true);
+		}
+	});
+	$('#dialog_list').dialog({
+		modal : false,
+		title : nodeId+"'s circuits",
+		buttons : {
+			"Done" : function() {
+				$(this).dialog('close');
+			}
+		},
+		width : 400
+	});
+}
+function showChannels(srcNode, dstNode)
+{
+	var srcLinkTable = nodeTable[srcNode][LINKTABLE];
+	var srcIf = srcLinkTable[dstNode][0].split("<br/>");
+	var dstLinkTable = nodeTable[dstNode][LINKTABLE];
+	var dstIf = dstLinkTable[srcNode][0].split("<br/>");
+	var srcConnTable = nodeTable[srcNode][XCONNTABLE];
+	var dstConnTable = nodeTable[dstNode][XCONNTABLE];
+
+	$('#sel_list').empty();
+	for ( var sport in srcConnTable ) {
+		if ( sport.indexOf(srcIf[0])!=-1 ) {
+			var line = '<li><pre>'+sport+"\t"+srcConnTable[sport][3];
+			var dport = sport.replace(srcIf[0],dstIf[0]);
+			if ( dport in dstConnTable )
+				line += "\t"+dport+"\t"+dstConnTable[dport][3];
+			else {
+				if ( dport.split(".")[0] in dstConnTable )
+					line += "\t"+dport;
+			}
+			$('#sel_list').append(line+"</pre></li>");
+		}
+	}
+	$('#sel_list').selectable({
+		selected: function(event, ui) {
+			jsPlumb.setSuspendDrawing(true);
+			var conn = $(ui.selected).text().split("\t");
+			highlightLink(srcNode, conn[0]);
+			if ( conn.length>2 ) highlightLink(dstNode, conn[2]);
+			jsPlumb.setSuspendDrawing(false, true);
+		}
+	});
+	$('#dialog_list').dialog({
+		modal : false,
+		title : "channels between "+srcNode+" and "+dstNode,
+		buttons : {
+			"Done" : function() {
+				$(this).dialog('close');
+			}
+		},
+		width : 400
+	});
+}
+function getNodes(nodeId)
+{
+	$.post( URL,
+	{
+		SQL: "select distinct nodename from Nodes"
+	},
+	function(data, status) {
+		$('#dialog_nodes').empty();
+		var nodes = data.split("\n");
+		for ( var i=1; i<nodes.length; i++ )
+			$('#dialog_nodes').append("<option value='"+nodes[i]+"'>"+nodes[i]+"</option>");
+		$('#dialog_nodes').val(nodeId);
+	});
+}
+function getResource(nodeId)
+{
+	$.post( URL,
+	{
+		SQL: "select distinct resource from PMhistory where nodename='"+nodeId+"'"
+	},
+	function(data, status) {
+		$('#dialog_resource').empty();
+		var nodes = data.split("\n");
+		for ( var i=1; i<nodes.length; i++ )
+			$('#dialog_resource').append("<option value='"+nodes[i]+"'>"+nodes[i]+"</option>");
+	});
+}
+function getFaults(nodeId)
+{
+	$.post( URL,
+	{
+		SQL: "select resource,alarm,raised,severity from Alarms where nodename='"+nodeId+"' and cleared=''"
+	},
+	function(data, status) {
+		var table = data.replace(/\t/g, "</td><td>");
+		table = table.replace(/\n/g, "</td></tr><tr><td>");
+		$('#info').html('<table><tr><td>'+table+'</td></tr></table>');
+	});
+}
+function showAlarms(nodeId)
+{
+	$('#dialog_resource').hide();
+	getNodes(nodeId);
+	getFaults(nodeId);
+	$('#dialog_nodes').change(function () { 
+		getFaults($('#dialog_nodes').val());
+	});
+	$('#dialog_info').dialog({
+		modal : false,
+		title : "Alarms",
+		buttons : {
+			"Ok" : function() {
+				$(this).dialog('close');
+			}
+		},
+		width : 600
+	}).css({height:"400px", overflow:"auto"});
+}
+function getPM(nodeId, resource)
+{
+	$.post( URL,
+	{
+		SQL: "select pm_time,pm_registers from PMhistory where nodename='"+nodeId+"' and resource='"+resource+"' order by pm_time DESC"
+	},
+	function(data, status) {
+		var table = data.replace("pm_time\tpm_registers\n","").replace("9999-00-00T00:00","pm_time");
+		table = table.replace(/\t /g," ").replace(/[ \t]/g, "</td><td>");
+		table = table.replace(/\n/g, "</td></tr><tr><td>");
+		$('#info').html('<table><tr><td>'+table+'</td></tr></table>');
+	});
+}
+function showPM(nodeId)
+{
+	$('#dialog_resource').show();
+	getNodes(nodeId);
+	$('#dialog_nodes').change(function () { 
+		getResource($('#dialog_nodes').val());
+	});
+	getResource(nodeId);
+	$('#dialog_resource').change(function () { 
+		getPM($('#dialog_nodes').val(), $('#dialog_resource').val());
+	});
+	setTimeout( function() { getPM(nodeId, $('#dialog_resource').val()); }, 500 );
+	$('#dialog_info').dialog({
+		modal : false,
+		title : "Performance registers",
+		buttons : {
+			"Ok" : function() {
+				$(this).dialog('close');
+			}
+		},
+		width : 600
+	}).css({height:"400px", overflow:"auto"});
+}
+function cliNode(nodeId)
+{
+	var cmd = "http://127.0.0.1:8090/?New=";
+	if ( nodeTable[nodeId][TYPE]=="FWCDS" ) 
+		cmd += "telnet ";
+	else 
+		cmd += "ssh -pw 1finity fujitsu@"
+	cmd += nodeTable[nodeId][ADDRESS];
+	if ( nodeTable[nodeId][TYPE]=="S-Series" )
+		cmd += ":2024";
+	$.get( cmd );
+}
+function connectNode(nodeId)
+{
+	for ( nodeId in nodeTable ) {
+		if ( nodeTable[nodeId][SELECTED] ) {
+			if ( nodeTable[nodeId][STATUS]=='Authentication' ) 
+				loginNode(nodeId);
+			else {
+				$.post( URL,
+				{
+					connect: nodeId +"\t"+ 
+							 nodeTable[nodeId][ADDRESS] +"\t"+ 
+							 nodeTable[nodeId][PROTOCOL] +"\t"+ 
+							 nodeTable[nodeId][TYPE]
+				});
+			}
+		}
+	}
+}
+function loginNode(nodeId) 
+{
+	$('#dialog_login_node').dialog({
+		modal : true,
+		buttons : {
+			"Login" : function() {
+				var username = $('#login_user').val();
+				var password = $('#login_pass').val();
+				$.post( URL,
+				{
+					user: nodeId+"\t"+username+" "+password 
+				});
+				$(this).dialog('close');
+			},
+			"Cancel" : function() {
+				$('#login_user').val("");
+				$('#login_pass').val("");
+				$(this).dialog('close');
+			}
+		},
+		width : 250
+	});
+}
+function loggingNode(nodeId)
+{
+	for ( nodeId in nodeTable ) {
+		if ( nodeTable[nodeId][SELECTED] ) {
+			$.post( URL, 
+			{
+				logging: nodeId
+			});
+		}
+	}
+}
+function disconnNode(nodeId)
+{
+	for ( nodeId in nodeTable ) {
+		if ( nodeTable[nodeId][SELECTED] ) {
+			$.post( URL, 
+			{
+				disconn: nodeId
+			});
+		}
+	}
+}
+function resyncNode(nodeId) 
+{
+	for ( nodeId in nodeTable ) {
+		if ( nodeTable[nodeId][0] ) {
+			$.post( URL,
+			{
+				sync: nodeId
+			});
+		}
+	}	
+}
+
+function cloneNode(nodeId)
+{
+	$('#new_node_name').val(nodeId);
+	$('#new_node_ip').val(nodeTable[nodeId][1]);
+	$('#dialog_new_node').dialog({
+		modal : true,
+		buttons : {
+			"Create node" : function() {
+				var nodeName = $('#new_node_name').val();
+				var nodeIp = $('#new_node_ip').val();
+				var nodeType = $('#new_node_type').val();
+				$.post( URL, 
+				{
+					SQL: "insert into Nodes (nodename, address, protocol, type, status, left, top) values ('"+nodeName+"','"+nodeIp+"','netconf','"+nodeType+"','Disconnected','8','8')"
+				});	
+				$(this).dialog('close');
+			},
+			"Cancel" : function() {
+				$(this).dialog('close');
+			}
+		},
+		width : 250
+	});
+}
+function deleteNode(nodeId)
+{
+	$('#info').html("Delete "+nodeId+"?");
+	$('#dialog_info').dialog({
+		resizable: false,
+		modal: true,
+		title: "Please confirm",
+		buttons: {
+			"Delete": function() {
+				$.post( URL,
+				{
+					SQL: "delete from Nodes where nodename='"+nodeId+"'"
+				},
+				function(data, status) {
+					// delete connections attached to the node
+					for(var linkId in linkTable) {
+						var link = linkTable[linkId];
+						if ( (link[0] == nodeId) || (link[2] == nodeId) ) {
+							jsPlumb.deleteConnection(linkTable[linkId][4]);
+							delete linkTable[linkId];
+						}
+					}
+					delete nodeTable[nodeId];
+					$('#node_' + nodeId).remove();	// delete node div
+					$('#alarm_'+ nodeId).remove();	// delete alarm div
+				});
+			$(this).dialog('close');
+			},
+			"Cancel": function() {
+				$(this).dialog('close');
+			}
+		}
+	});
+}
+</script>
+	</head>
+	<body>
+		<ul id="menu">
+			<li><div>Link Label</div>
+			<ul>
+				<li><div>port name</div></li>
+				<li><div>port PM</div></li>
+				<li><div>none</div></li>
+			</ul>
+		</ul>
+		<div id='topo' title='Topology' class='canvas'></div>
+		<div id='dialog_new_node' title='New node' class='dialog'>
+			<table>
+				<tr><td>nodename:</td>
+				<td><input id='new_node_name' type='text' maxlength='255' size='20'></td></tr>
+				<tr><td>address:</td>
+				<td><input id='new_node_ip' type='text' maxlength='15' size='15'></td></tr>
+				<tr><td>protocol:</td>
+				<td><select id='new_node_protocol' type='text' maxlength='15'>
+						<option value='netconf'>NETCONF</option>
+					 </select>
+				</td></tr>
+				<tr><td>type:</td>
+				<td><select id='new_node_type' type='text' maxlength='15'>
+						<option value='L-Series'>L100</option>
+						<option value='L200'>L200</option>
+						<option value='S-Series'>S100</option>
+						<option value='T100'>T100</option>
+						<option value='T200'>T200</option>
+						<option value='T300'>T300</option>
+						<option value='T400'>T400</option>
+						<option value='FUJITSU L-Series'>OROADM WDM</option>
+						<option value='FUJITSU T-Series'>OROADM XPDR</option>
+					 </select>
+				</td></tr>
+			</table>		
+		</div>
+		<div id='dialog_login_node' title='Login node' class='dialog'>
+			username:<input id='login_user' type='text' maxlength='32' size='20'>
+			password:<input id='login_pass' type='password' maxlength='32' size='20'>
+		</div>
+		<div id='dialog_info' title='Information' class='dialog'>
+			<select id='dialog_nodes'></select>
+			<select id='dialog_resource'></select>
+			<div id='info'></div>
+		</div>
+		<div id='dialog_list' title='selectable list' class='dialog'>
+			<ul id='sel_list'></ul>
+		</div>
+	</body>
+</html>
