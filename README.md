@@ -3,7 +3,7 @@ FLTK based graphical front end for SQLite3, build to display and manipulate data
 ![sorting and filting](doc/flTable1.png)
 ![copy, paste, insert](doc/flTable2.png)
 
-#scripting interface
+## scripting interface
 A build in http server allows data to be retrieved by any script using xmlxttp interface, Topology.html is an example using javascript, jquery and jsplumb to display network topology in any browser window
 ![sorting and filting](doc/flTable3.png)
 highlighting an end to end circuit through DWDM network 
